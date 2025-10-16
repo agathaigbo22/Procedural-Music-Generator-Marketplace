@@ -11,10 +11,17 @@
 (define-constant err-already-exists (err u107))
 (define-constant err-invalid-price (err u108))
 (define-constant err-self-transfer (err u109))
+(define-constant err-invalid-rating (err u110))
+(define-constant err-already-rated (err u111))
+(define-constant err-collection-not-found (err u112))
+(define-constant err-not-collection-owner (err u113))
+(define-constant err-track-already-in-collection (err u114))
+(define-constant err-track-not-in-collection (err u115))
 
 (define-data-var last-token-id uint u0)
 (define-data-var platform-fee-rate uint u250)
 (define-data-var platform-fee-recipient principal contract-owner)
+(define-data-var last-collection-id uint u0)
 
 (define-map track-data
   { token-id: uint }
@@ -58,6 +65,45 @@
 (define-map total-earnings
   { token-id: uint }
   { amount: uint }
+)
+
+(define-map track-ratings
+  { token-id: uint, reviewer: principal }
+  {
+    rating: uint,
+    review: (string-ascii 256),
+    created-at: uint
+  }
+)
+
+(define-map track-rating-stats
+  { token-id: uint }
+  {
+    total-ratings: uint,
+    rating-sum: uint,
+    average-rating: uint
+  }
+)
+
+(define-map collections
+  { collection-id: uint }
+  {
+    owner: principal,
+    name: (string-ascii 64),
+    description: (string-ascii 256),
+    created-at: uint,
+    track-count: uint
+  }
+)
+
+(define-map collection-tracks
+  { collection-id: uint, token-id: uint }
+  { added-at: uint }
+)
+
+(define-map track-collections
+  { token-id: uint }
+  { collection-ids: (list 20 uint) }
 )
 
 (define-public (mint-music-track
@@ -249,6 +295,139 @@
   )
 )
 
+(define-public (rate-track
+    (token-id uint)
+    (rating uint)
+    (review (string-ascii 256))
+  )
+  (let
+    (
+      (track-exists (is-some (map-get? track-data { token-id: token-id })))
+      (existing-rating (map-get? track-ratings { token-id: token-id, reviewer: tx-sender }))
+      (current-stats (default-to { total-ratings: u0, rating-sum: u0, average-rating: u0 }
+                     (map-get? track-rating-stats { token-id: token-id })))
+      (current-block stacks-block-height)
+    )
+    (asserts! track-exists err-track-not-found)
+    (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+    (asserts! (is-none existing-rating) err-already-rated)
+    (map-set track-ratings
+      { token-id: token-id, reviewer: tx-sender }
+      {
+        rating: rating,
+        review: review,
+        created-at: current-block
+      }
+    )
+    (let
+      (
+        (new-total (+ (get total-ratings current-stats) u1))
+        (new-sum (+ (get rating-sum current-stats) rating))
+        (new-average (/ new-sum new-total))
+      )
+      (map-set track-rating-stats
+        { token-id: token-id }
+        {
+          total-ratings: new-total,
+          rating-sum: new-sum,
+          average-rating: new-average
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (create-collection
+    (name (string-ascii 64))
+    (description (string-ascii 256))
+  )
+  (let
+    (
+      (collection-id (+ (var-get last-collection-id) u1))
+      (current-block stacks-block-height)
+    )
+    (map-set collections
+      { collection-id: collection-id }
+      {
+        owner: tx-sender,
+        name: name,
+        description: description,
+        created-at: current-block,
+        track-count: u0
+      }
+    )
+    (var-set last-collection-id collection-id)
+    (ok collection-id)
+  )
+)
+
+(define-public (add-track-to-collection (collection-id uint) (token-id uint))
+  (let
+    (
+      (collection (unwrap! (map-get? collections { collection-id: collection-id }) err-collection-not-found))
+      (track-exists (is-some (map-get? track-data { token-id: token-id })))
+      (already-in-collection (is-some (map-get? collection-tracks { collection-id: collection-id, token-id: token-id })))
+      (current-collections (default-to (list) (get collection-ids (map-get? track-collections { token-id: token-id }))))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get owner collection)) err-not-collection-owner)
+    (asserts! track-exists err-track-not-found)
+    (asserts! (not already-in-collection) err-track-already-in-collection)
+    (map-set collection-tracks
+      { collection-id: collection-id, token-id: token-id }
+      { added-at: current-block }
+    )
+    (map-set track-collections
+      { token-id: token-id }
+      { collection-ids: (unwrap! (as-max-len? (append current-collections collection-id) u20) err-already-exists) }
+    )
+    (map-set collections
+      { collection-id: collection-id }
+      {
+        owner: (get owner collection),
+        name: (get name collection),
+        description: (get description collection),
+        created-at: (get created-at collection),
+        track-count: (+ (get track-count collection) u1)
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (remove-track-from-collection (collection-id uint) (token-id uint))
+  (let
+    (
+      (collection (unwrap! (map-get? collections { collection-id: collection-id }) err-collection-not-found))
+      (track-in-collection (is-some (map-get? collection-tracks { collection-id: collection-id, token-id: token-id })))
+      (current-collections (default-to (list) (get collection-ids (map-get? track-collections { token-id: token-id }))))
+    )
+    (asserts! (is-eq tx-sender (get owner collection)) err-not-collection-owner)
+    (asserts! track-in-collection err-track-not-in-collection)
+    (map-delete collection-tracks { collection-id: collection-id, token-id: token-id })
+    (map-set track-collections
+      { token-id: token-id }
+      { collection-ids: (filter is-not-collection-id current-collections) }
+    )
+    (map-set collections
+      { collection-id: collection-id }
+      {
+        owner: (get owner collection),
+        name: (get name collection),
+        description: (get description collection),
+        created-at: (get created-at collection),
+        track-count: (- (get track-count collection) u1)
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-private (is-not-collection-id (id uint))
+  (not (is-eq id (var-get last-collection-id)))
+)
+
 (define-read-only (get-track-info (token-id uint))
   (map-get? track-data { token-id: token-id })
 )
@@ -296,3 +475,34 @@
   )
 )
 
+(define-read-only (get-track-rating (token-id uint) (reviewer principal))
+  (map-get? track-ratings { token-id: token-id, reviewer: reviewer })
+)
+
+(define-read-only (get-track-rating-stats (token-id uint))
+  (map-get? track-rating-stats { token-id: token-id })
+)
+
+(define-read-only (get-track-average-rating (token-id uint))
+  (default-to u0 (get average-rating (map-get? track-rating-stats { token-id: token-id })))
+)
+
+(define-read-only (get-track-total-ratings (token-id uint))
+  (default-to u0 (get total-ratings (map-get? track-rating-stats { token-id: token-id })))
+)
+
+(define-read-only (get-collection-info (collection-id uint))
+  (map-get? collections { collection-id: collection-id })
+)
+
+(define-read-only (get-track-collections (token-id uint))
+  (map-get? track-collections { token-id: token-id })
+)
+
+(define-read-only (is-track-in-collection (collection-id uint) (token-id uint))
+  (is-some (map-get? collection-tracks { collection-id: collection-id, token-id: token-id }))
+)
+
+(define-read-only (get-last-collection-id)
+  (var-get last-collection-id)
+)
