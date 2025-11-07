@@ -17,6 +17,9 @@
 (define-constant err-not-collection-owner (err u113))
 (define-constant err-track-already-in-collection (err u114))
 (define-constant err-track-not-in-collection (err u115))
+(define-constant err-invalid-offer (err u116))
+(define-constant err-offer-not-found (err u117))
+(define-constant err-offer-expired (err u118))
 
 (define-data-var last-token-id uint u0)
 (define-data-var platform-fee-rate uint u250)
@@ -104,6 +107,24 @@
 (define-map track-collections
   { token-id: uint }
   { collection-ids: (list 20 uint) }
+)
+
+(define-map track-offers
+  { token-id: uint, bidder: principal }
+  {
+    price: uint,
+    expires-at: uint,
+    created-at: uint,
+    active: bool
+  }
+)
+
+(define-map track-best-offers
+  { token-id: uint }
+  {
+    bidder: principal,
+    price: uint
+  }
 )
 
 (define-public (mint-music-track
@@ -428,6 +449,120 @@
   (not (is-eq id (var-get last-collection-id)))
 )
 
+(define-public (make-offer
+    (token-id uint)
+    (price uint)
+    (duration-blocks uint)
+  )
+  (let
+    (
+      (track-exists (is-some (map-get? track-data { token-id: token-id })))
+      (owner (unwrap! (nft-get-owner? music-track token-id) err-track-not-found))
+      (current-block stacks-block-height)
+      (expires-at (+ current-block duration-blocks))
+      (existing-offer (map-get? track-offers { token-id: token-id, bidder: tx-sender }))
+      (best-offer (map-get? track-best-offers { token-id: token-id }))
+    )
+    (asserts! track-exists err-track-not-found)
+    (asserts! (> price u0) err-invalid-price)
+    (asserts! (> duration-blocks u0) err-invalid-offer)
+    (asserts! (not (is-eq tx-sender owner)) err-self-transfer)
+    (map-set track-offers
+      { token-id: token-id, bidder: tx-sender }
+      {
+        price: price,
+        expires-at: expires-at,
+        created-at: current-block,
+        active: true
+      }
+    )
+    (match best-offer
+      current-best
+      (if (> price (get price current-best))
+        (map-set track-best-offers
+          { token-id: token-id }
+          { bidder: tx-sender, price: price }
+        )
+        true
+      )
+      (map-set track-best-offers
+        { token-id: token-id }
+        { bidder: tx-sender, price: price }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (accept-offer (token-id uint) (bidder principal))
+  (let
+    (
+      (owner (unwrap! (nft-get-owner? music-track token-id) err-track-not-found))
+      (track-info (unwrap! (map-get? track-data { token-id: token-id }) err-track-not-found))
+      (offer (unwrap! (map-get? track-offers { token-id: token-id, bidder: bidder }) err-offer-not-found))
+      (price (get price offer))
+      (creator (get creator track-info))
+      (royalty-rate (get royalty-rate track-info))
+      (platform-fee (/ (* price (var-get platform-fee-rate)) u10000))
+      (royalty-amount (/ (* price royalty-rate) u10000))
+      (seller-amount (- (- price platform-fee) royalty-amount))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    (asserts! (get active offer) err-offer-not-found)
+    (asserts! (< current-block (get expires-at offer)) err-offer-expired)
+    (try! (stx-transfer? price bidder tx-sender))
+    (if (> platform-fee u0)
+      (try! (stx-transfer? platform-fee tx-sender (var-get platform-fee-recipient)))
+      true
+    )
+    (if (and (> royalty-amount u0) (not (is-eq creator tx-sender)))
+      (begin
+        (try! (stx-transfer? royalty-amount tx-sender creator))
+        (map-set royalty-balances
+          { creator: creator }
+          { balance: (+ (default-to u0 (get balance (map-get? royalty-balances { creator: creator }))) royalty-amount) }
+        )
+      )
+      true
+    )
+    (try! (nft-transfer? music-track token-id tx-sender bidder))
+    (map-set track-offers
+      { token-id: token-id, bidder: bidder }
+      {
+        price: price,
+        expires-at: (get expires-at offer),
+        created-at: (get created-at offer),
+        active: false
+      }
+    )
+    (map-set total-earnings
+      { token-id: token-id }
+      { amount: (+ (default-to u0 (get amount (map-get? total-earnings { token-id: token-id }))) price) }
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-offer (token-id uint))
+  (let
+    (
+      (offer (unwrap! (map-get? track-offers { token-id: token-id, bidder: tx-sender }) err-offer-not-found))
+    )
+    (asserts! (get active offer) err-offer-not-found)
+    (map-set track-offers
+      { token-id: token-id, bidder: tx-sender }
+      {
+        price: (get price offer),
+        expires-at: (get expires-at offer),
+        created-at: (get created-at offer),
+        active: false
+      }
+    )
+    (ok true)
+  )
+)
+
 (define-read-only (get-track-info (token-id uint))
   (map-get? track-data { token-id: token-id })
 )
@@ -505,4 +640,20 @@
 
 (define-read-only (get-last-collection-id)
   (var-get last-collection-id)
+)
+
+(define-read-only (get-offer (token-id uint) (bidder principal))
+  (map-get? track-offers { token-id: token-id, bidder: bidder })
+)
+
+(define-read-only (get-best-offer (token-id uint))
+  (map-get? track-best-offers { token-id: token-id })
+)
+
+(define-read-only (is-offer-valid (token-id uint) (bidder principal))
+  (match (map-get? track-offers { token-id: token-id, bidder: bidder })
+    offer
+    (and (get active offer) (< stacks-block-height (get expires-at offer)))
+    false
+  )
 )
