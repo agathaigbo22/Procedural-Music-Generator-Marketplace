@@ -20,6 +20,9 @@
 (define-constant err-invalid-offer (err u116))
 (define-constant err-offer-not-found (err u117))
 (define-constant err-offer-expired (err u118))
+(define-constant err-invalid-collaborator (err u119))
+(define-constant err-max-collaborators (err u120))
+(define-constant err-invalid-split (err u121))
 
 (define-data-var last-token-id uint u0)
 (define-data-var platform-fee-rate uint u250)
@@ -125,6 +128,16 @@
     bidder: principal,
     price: uint
   }
+)
+
+(define-map track-collaborators
+  { token-id: uint }
+  { collaborators: (list 5 { address: principal, split: uint }) }
+)
+
+(define-map collaborator-earnings
+  { collaborator: principal }
+  { total-earned: uint }
 )
 
 (define-public (mint-music-track
@@ -656,4 +669,83 @@
     (and (get active offer) (< stacks-block-height (get expires-at offer)))
     false
   )
+)
+
+(define-private (validate-split-total (collaborators (list 5 { address: principal, split: uint })))
+  (fold + (map get-split collaborators) u0)
+)
+
+(define-private (get-split (entry { address: principal, split: uint }))
+  (get split entry)
+)
+
+(define-public (set-track-collaborators
+    (token-id uint)
+    (collaborators (list 5 { address: principal, split: uint }))
+  )
+  (let
+    (
+      (track-info (unwrap! (map-get? track-data { token-id: token-id }) err-track-not-found))
+      (creator (get creator track-info))
+      (total-split (validate-split-total collaborators))
+    )
+    (asserts! (is-eq tx-sender creator) err-not-token-owner)
+    (asserts! (<= (len collaborators) u5) err-max-collaborators)
+    (asserts! (<= total-split u10000) err-invalid-split)
+    (map-set track-collaborators
+      { token-id: token-id }
+      { collaborators: collaborators }
+    )
+    (ok true)
+  )
+)
+
+(define-private (distribute-to-collaborator (entry { address: principal, split: uint }) (state { amount: uint, remaining: uint }))
+  (let
+    (
+      (share (/ (* (get amount state) (get split entry)) u10000))
+      (collaborator-addr (get address entry))
+      (current-earnings (default-to u0 (get total-earned (map-get? collaborator-earnings { collaborator: collaborator-addr }))))
+    )
+    (map-set collaborator-earnings
+      { collaborator: collaborator-addr }
+      { total-earned: (+ current-earnings share) }
+    )
+    { amount: (get amount state), remaining: (- (get remaining state) share) }
+  )
+)
+
+(define-public (distribute-collaboration-royalties (token-id uint) (amount uint))
+  (let
+    (
+      (track-info (unwrap! (map-get? track-data { token-id: token-id }) err-track-not-found))
+      (creator (get creator track-info))
+      (collab-data (map-get? track-collaborators { token-id: token-id }))
+    )
+    (asserts! (is-eq tx-sender creator) err-not-token-owner)
+    (match collab-data
+      collabs
+      (let
+        (
+          (result (fold distribute-to-collaborator (get collaborators collabs) { amount: amount, remaining: amount }))
+          (creator-share (get remaining result))
+          (current-creator-earnings (default-to u0 (get total-earned (map-get? collaborator-earnings { collaborator: creator }))))
+        )
+        (map-set collaborator-earnings
+          { collaborator: creator }
+          { total-earned: (+ current-creator-earnings creator-share) }
+        )
+        (ok creator-share)
+      )
+      (ok amount)
+    )
+  )
+)
+
+(define-read-only (get-track-collaborators (token-id uint))
+  (map-get? track-collaborators { token-id: token-id })
+)
+
+(define-read-only (get-collaborator-earnings (collaborator principal))
+  (default-to u0 (get total-earned (map-get? collaborator-earnings { collaborator: collaborator })))
 )
